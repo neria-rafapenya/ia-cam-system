@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#f5f9fc" stroke="#d7e5ef" stroke-width="2"/>
+  <text x="8" y="31" textLength="48" lengthAdjust="spacingAndGlyphs" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="800" letter-spacing="-2" fill="#123b63">wad</text>
+  <text x="24" y="48" textLength="26" lengthAdjust="spacingAndGlyphs" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1676c7">.cat</text>
+</svg>
