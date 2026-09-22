@@ -4,6 +4,8 @@ Prototipo local para probar la monitorización de una cámara mediante webcam, c
 
 ## Puesta en marcha
 
+El acceso de desarrollo y producción se gestiona con Cognito. La app cliente pública no contiene secretos. Antes de iniciar sesión, usa una cuenta ya creada en el User Pool `ia-serverless-app-dev-users` de `eu-west-1`.
+
 Backend:
 
 ```bash
@@ -23,6 +25,19 @@ npm run dev
 ```
 
 Abrir `http://localhost:5173` y conceder permiso para usar la webcam.
+
+El frontend inicia sesión directamente contra Cognito por HTTPS con el flujo de usuario y contraseña; no necesita URL de callback ni un secreto de cliente. El backend valida firma RS256, emisor, caducidad, uso del token y cliente Cognito en todos los endpoints `/api/*`; `/health` permanece público. Para ejecutar el backend en local, define el mismo User Pool y cliente:
+
+```bash
+export COGNITO_USER_POOL_ID=eu-west-1_iFcHB8J7W
+export COGNITO_APP_CLIENT_ID=1016qiheeqcsef2m4n9jek2c9s
+```
+
+El frontend incluye estos identificadores públicos como valores por defecto. Si se sustituyen por otro User Pool, define `VITE_COGNITO_REGION`, `VITE_COGNITO_USER_POOL_ID` y `VITE_COGNITO_CLIENT_ID` antes de compilar.
+
+Al cerrar sesión se detiene la webcam y el detector de movimiento, se abortan las peticiones abiertas desde el navegador y se revoca el refresh token. Si Bedrock ya había comenzado una inferencia, el cierre no puede garantizar que AWS la interrumpa ni evitar su cargo.
+
+Al publicar este cambio, actualiza también la CORS de la Lambda Function URL para permitir la cabecera `Authorization` junto a `content-type`; de lo contrario el navegador bloqueará las llamadas autenticadas desde CloudFront. La URL de la Function queda pública, pero los endpoints `/api/*` rechazan solicitudes sin JWT válido.
 
 ## Estado actual
 

@@ -5,14 +5,15 @@ from datetime import datetime, timezone
 from typing import Literal
 
 import boto3
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from mangum import Mangum
 from .logistics_api import router as logistics_router
+from .auth import require_cognito_access_token
 
 app = FastAPI(title="BgTrans IA Camera API", version="0.2.0")
-app.include_router(logistics_router)
+app.include_router(logistics_router, dependencies=[Depends(require_cognito_access_token)])
 allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 if os.getenv("FRONTEND_ORIGIN"):
     allowed_origins.extend(origin.strip() for origin in os.getenv("FRONTEND_ORIGIN", "").split(",") if origin.strip())
@@ -82,7 +83,7 @@ def health():
     return {"status": "ok", "service": "ia-cam-system", "provider": os.getenv("ANALYSIS_PROVIDER", "mock")}
 
 
-@app.post("/api/analyze", response_model=AnalyzeResponse)
+@app.post("/api/analyze", response_model=AnalyzeResponse, dependencies=[Depends(require_cognito_access_token)])
 def analyze(payload: AnalyzeRequest):
     if os.getenv("ANALYSIS_PROVIDER", "mock").lower() == "bedrock":
         return bedrock_analysis(payload)

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Bot, BookOpen, Camera, CheckCircle2, CircleHelp, Clock3, Coins, FileImage, Gauge, MapPin, Play, RefreshCw, Route, Send, ShieldCheck, Square, Trash2, Truck, Video, XCircle } from 'lucide-react'
+import { AlertTriangle, Bot, BookOpen, Camera, CheckCircle2, CircleHelp, Clock3, Coins, FileImage, Gauge, LockKeyhole, LogOut, MapPin, Play, RefreshCw, Route, Send, ShieldCheck, Square, Trash2, Truck, Video, XCircle } from 'lucide-react'
+import { clearSession, completeNewPassword, refreshCognitoSession, restoreCognitoSession, revokeCognitoSession, saveSession, signInCognito } from './auth'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 const initialEvents = [{ id: 1, time: 'Ahora', type: 'Sistema', title: 'Cámara lista para monitorización', detail: 'La webcam local está disponible.', status: 'normal' }]
@@ -14,6 +15,9 @@ function readUsage() {
 
 function App() {
   const videoRef = useRef(null), captureCanvasRef = useRef(null), motionCanvasRef = useRef(null), streamRef = useRef(null), previousFrameRef = useRef(null), motionStreakRef = useRef(0), lastMotionRef = useRef(0), analyzingRef = useRef(false)
+  const activeRequestsRef = useRef(new Set())
+  const logoutInProgressRef = useRef(false)
+  const [authSession, setAuthSession] = useState(null), [authLoading, setAuthLoading] = useState(true), [loggingOut, setLoggingOut] = useState(false)
   const [view, setView] = useState('cameras')
   const [procedureScenario, setProcedureScenario] = useState('temperature')
   const [incidents, setIncidents] = useState([])
@@ -25,6 +29,11 @@ function App() {
   const [motionActive, setMotionActive] = useState(false), [motionDetected, setMotionDetected] = useState(false)
   const [logistics, setLogistics] = useState(null), [logisticsError, setLogisticsError] = useState(''), [logisticsLoading, setLogisticsLoading] = useState(false)
 
+  useEffect(() => {
+    let mounted = true
+    restoreCognitoSession().then(session => { if (mounted) { setAuthSession(session); setAuthLoading(false) } })
+    return () => { mounted = false }
+  }, [])
   useEffect(() => () => stopCamera(), [])
   useEffect(() => { if (cameraState !== 'live' || !motionActive) return undefined; const timer = window.setInterval(checkMotion, 900); return () => window.clearInterval(timer) }, [cameraState, motionActive])
   useEffect(() => {
@@ -33,7 +42,7 @@ function App() {
     const load = async (initial = false) => {
       if (initial) setLogisticsLoading(true)
       try {
-        const response = await fetch(`${API_URL}/api/logistics/overview`)
+        const response = await authenticatedFetch(`${API_URL}/api/logistics/overview`)
         const data = await response.json().catch(() => ({}))
         if (!response.ok) throw new Error(data.detail || `El backend ha respondido con HTTP ${response.status}`)
         if (alive) { setLogistics(data); setLogisticsError('') }
@@ -44,6 +53,34 @@ function App() {
     load(true)
     return () => { alive = false }
   }, [view])
+
+  async function authenticatedFetch(url, options = {}) {
+    if (!authSession || logoutInProgressRef.current) throw new Error('Inicia sesión para continuar.')
+    let session = authSession
+    if (session.expiresAt <= Date.now() + 30_000 && session.refreshToken) {
+      try { session = await refreshCognitoSession(session.refreshToken) }
+      catch { void logout(); throw new Error('La sesión ha caducado. Inicia sesión de nuevo.') }
+      setAuthSession(session)
+    }
+    const controller = new AbortController()
+    activeRequestsRef.current.add(controller)
+    try {
+      const headers = new Headers(options.headers || {})
+      headers.set('Authorization', `Bearer ${session.accessToken}`)
+      const response = await fetch(url, { ...options, headers, signal: controller.signal })
+      if (response.status === 401 && session.refreshToken) {
+        let renewed
+        try { renewed = await refreshCognitoSession(session.refreshToken) }
+        catch { void logout(); throw new Error('La sesión ha caducado. Inicia sesión de nuevo.') }
+        setAuthSession(renewed)
+        headers.set('Authorization', `Bearer ${renewed.accessToken}`)
+        const retry = await fetch(url, { ...options, headers, signal: controller.signal })
+        if (retry.status === 401) { void logout(); throw new Error('La sesión ya no es válida. Inicia sesión de nuevo.') }
+        return retry
+      }
+      return response
+    } finally { activeRequestsRef.current.delete(controller) }
+  }
 
   function stopCamera() { streamRef.current?.getTracks().forEach(track => track.stop()); streamRef.current = null; if (videoRef.current) videoRef.current.srcObject = null; previousFrameRef.current = null; motionStreakRef.current = 0; setMotionActive(false); setMotionDetected(false); setCameraState('idle') }
   async function startCamera() { setError(''); try { const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }); streamRef.current = stream; setCameraState('live'); requestAnimationFrame(async () => { if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play() } }) } catch (err) { setError(`No se pudo acceder a la cámara (${err?.name || 'error desconocido'}). Comprueba los permisos del navegador.`); setCameraState('error') } }
@@ -60,11 +97,38 @@ function App() {
       return next
     })
   }
-  async function analyzeImage(image, detected) { if (!image || analyzingRef.current) return; analyzingRef.current = true; setBusy(true); setError(''); try { const response = await fetch(`${API_URL}/api/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image, camera_id: 'webcam-local', source: window.location.origin, motion_detected: detected }) }); const result = await response.json().catch(() => ({})); if (!response.ok) throw new Error(result.detail || `El backend ha respondido con HTTP ${response.status}`); setAnalysis(result); setLastAiProvider(result.provider || 'mock'); recordAiUsage(result.provider || 'mock', result.usage, 'Análisis de cámara', result.model_id); setEvents(current => [{ id: Date.now(), time: formatEventTime(result.analyzed_at), type: result.label, title: result.title, detail: result.detail, status: result.status }, ...current]) } catch (err) { setError(err?.message || 'No se pudo conectar con el backend.') } finally { analyzingRef.current = false; setBusy(false) } }
+  async function analyzeImage(image, detected) { if (!image || analyzingRef.current || !authSession || logoutInProgressRef.current) return; analyzingRef.current = true; setBusy(true); setError(''); try { const response = await authenticatedFetch(`${API_URL}/api/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image, camera_id: 'webcam-local', source: window.location.origin, motion_detected: detected }) }); const result = await response.json().catch(() => ({})); if (!response.ok) throw new Error(result.detail || `El backend ha respondido con HTTP ${response.status}`); setAnalysis(result); setLastAiProvider(result.provider || 'mock'); recordAiUsage(result.provider || 'mock', result.usage, 'Análisis de cámara', result.model_id); setEvents(current => [{ id: Date.now(), time: formatEventTime(result.analyzed_at), type: result.label, title: result.title, detail: result.detail, status: result.status }, ...current]) } catch (err) { if (err?.name !== 'AbortError') setError(err?.message || 'No se pudo conectar con el backend.') } finally { analyzingRef.current = false; setBusy(false) } }
   async function analyzeSnapshot() { analyzeImage(snapshot, motionDetected) }
+
+  async function logout() {
+    const session = authSession
+    logoutInProgressRef.current = true
+    setLoggingOut(true)
+    stopCamera()
+    activeRequestsRef.current.forEach(controller => controller.abort())
+    activeRequestsRef.current.clear()
+    analyzingRef.current = false
+    clearSession()
+    setLoggingOut(false)
+    setAuthSession(null)
+    setView('cameras')
+    setSnapshot(null)
+    setSnapshotAt(null)
+    setAnalysis(null)
+    setMotionActive(false)
+    setEvents(initialEvents)
+    setIncidents([])
+    setEvidenceFlags({})
+    setLogistics(null)
+    setUsage(readUsage())
+    try { await revokeCognitoSession(session) } catch { /* El cierre local y la detención de procesos no dependen de la revocación remota. */ }
+    setLoggingOut(false)
+  }
 
   const statusText = cameraState === 'live' ? 'En directo' : cameraState === 'error' ? 'Sin permisos' : 'Desconectada'
   const isVehicles = view === 'vehicles', isCosts = view === 'costs'
+  if (authLoading) return <div className="auth-loading"><RefreshCw className="spin" size={20}/> Comprobando sesión segura…</div>
+  if (!authSession) return <LoginScreen onAuthenticated={session => { logoutInProgressRef.current = false; saveSession(session); setAuthSession(session) }} />
   return <div className="app-shell">
     <aside className="sidebar"><div className="brand"><div className="brand-mark">B</div><div><strong>BG Logistics</strong><span>Monitor operativo · demo</span></div></div><nav>
       <button className={view === 'cameras' ? 'active' : ''} onClick={() => setView('cameras')}><Camera size={17}/> Cámaras</button>
@@ -73,9 +137,9 @@ function App() {
       <button className={isCosts ? 'active' : ''} onClick={() => setView('costs')}><Coins size={17}/> Coste IA</button>
       <button className={view === 'incidents' ? 'active' : ''} onClick={() => setView('incidents')}><AlertTriangle size={17}/> Incidencias {incidents.filter(item => item.status === 'open').length > 0 && <span className="nav-soon">{incidents.filter(item => item.status === 'open').length}</span>}</button>
       <button className={view === 'evidence' ? 'active' : ''} onClick={() => setView('evidence')}><FileImage size={17}/> Evidencias</button>
-    </nav><div className="sidebar-footer"><div className="sidebar-prototype"><ShieldCheck size={15}/> Prototipo de demostración</div><div className={`provider-status ${lastAiProvider || 'unknown'}`}><span className="provider-light"/><div><strong>{lastAiProvider ? `Última respuesta: ${lastAiProvider.toUpperCase()}` : 'IA aún sin consultar'}</strong><small>{lastAiProvider ? 'Proveedor de la última consulta' : 'Se actualizará tras analizar o preguntar'}</small></div></div></div></aside>
+    </nav><div className="sidebar-footer"><div className="sidebar-prototype"><ShieldCheck size={15}/> Prototipo de demostración</div><div className={`provider-status ${lastAiProvider || 'unknown'}`}><span className="provider-light"/><div><strong>{lastAiProvider ? `Última respuesta: ${lastAiProvider.toUpperCase()}` : 'IA aún sin consultar'}</strong><small>{lastAiProvider ? 'Proveedor de la última consulta' : 'Se actualizará tras analizar o preguntar'}</small></div></div><button className="logout-button" onClick={logout} disabled={loggingOut}><LogOut size={15}/>{loggingOut ? 'Cerrando sesión…' : 'Cerrar sesión'}</button></div></aside>
     <main className="main-content"><header className="topbar"><div><p className="eyebrow">OPERACIONES · DEMO</p><h1>{isCosts ? 'Consumo estimado de IA' : isVehicles ? 'Seguimiento de vehículos' : view === 'procedures' ? 'Copiloto de procedimientos' : view === 'incidents' ? 'Incidencias' : view === 'evidence' ? 'Evidencias' : 'Monitor de cámaras'}</h1><p className="subtitle">{isCosts ? 'Registro local de inferencias realizadas desde esta aplicación' : isVehicles ? 'Vista simulada de flota, rutas, paradas y señales operativas' : view === 'procedures' ? 'Consulta guiada de documentación operativa y evidencias' : view === 'incidents' ? 'Casos escalados para revisión humana en esta sesión' : view === 'evidence' ? 'Capturas y registros asociados a eventos, con decisión de conservación' : 'Prueba local de movimiento y análisis visual'}</p></div><div className="connection"><span className={`dot ${isCosts || isVehicles || view === 'procedures' || view === 'incidents' || view === 'evidence' || cameraState === 'live' ? 'green' : ''}`}></span>{isCosts ? 'Estimación local' : isVehicles ? 'Datos simulados' : view === 'procedures' || view === 'incidents' || view === 'evidence' ? 'Datos mock locales' : statusText}</div></header>
-      {isCosts ? <UsageDashboard usage={usage} onClear={() => { setUsage(emptyUsage); try { window.localStorage.removeItem(USAGE_STORAGE_KEY) } catch { /* Sin almacenamiento persistente, el reinicio afecta a esta sesión. */ } }} /> : isVehicles ? <LogisticsDashboard data={logistics} error={logisticsError} loading={logisticsLoading} onProviderUsed={(provider, tokens, modelId) => { setLastAiProvider(provider); recordAiUsage(provider, tokens, 'Consulta de flota', modelId) }} onRefresh={() => { setLogisticsLoading(true); fetch(`${API_URL}/api/logistics/overview`).then(r => r.json().then(d => { if (!r.ok) throw new Error(d.detail || 'No se pudo actualizar'); return d })).then(d => { setLogistics(d); setLogisticsError('') }).catch(e => setLogisticsError(e.message)).finally(() => setLogisticsLoading(false)) }} /> : view === 'procedures' ? <ProcedureCopilot scenario={procedureScenario} onScenarioChange={setProcedureScenario} onMockConsult={() => { setLastAiProvider('mock'); recordAiUsage('mock', null, 'Consulta de procedimiento') }} onEscalate={incident => { setIncidents(current => [{ ...incident, id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, status: 'open', createdAt: new Date().toISOString() }, ...current]); setView('incidents') }} /> : view === 'incidents' ? <IncidentsDashboard incidents={incidents} onResolve={id => setIncidents(current => current.map(item => item.id === id ? { ...item, status: 'resolved', resolvedAt: new Date().toISOString() } : item))} onGoToProcedures={() => setView('procedures')} /> : view === 'evidence' ? <EvidenceDashboard snapshot={snapshot} snapshotAt={snapshotAt} analysis={analysis} incidents={incidents} flags={evidenceFlags} onToggle={id => setEvidenceFlags(current => ({ ...current, [id]: !current[id] }))} /> : <CameraDashboard {...{ videoRef, captureCanvasRef, motionCanvasRef, cameraState, statusText, startCamera, stopCamera, captureSnapshot, snapshot, setSnapshot, snapshotAt, setSnapshotAt, setAnalysis, analysis, motionDetected, setMotionDetected, analyzeSnapshot, busy, events, setEvents, motionActive, setMotionActive, error, setError }} />}
+      {isCosts ? <UsageDashboard usage={usage} onClear={() => { setUsage(emptyUsage); try { window.localStorage.removeItem(USAGE_STORAGE_KEY) } catch { /* Sin almacenamiento persistente, el reinicio afecta a esta sesión. */ } }} /> : isVehicles ? <LogisticsDashboard data={logistics} error={logisticsError} loading={logisticsLoading} authFetch={authenticatedFetch} onProviderUsed={(provider, tokens, modelId) => { setLastAiProvider(provider); recordAiUsage(provider, tokens, 'Consulta de flota', modelId) }} onRefresh={() => { setLogisticsLoading(true); authenticatedFetch(`${API_URL}/api/logistics/overview`).then(r => r.json().then(d => { if (!r.ok) throw new Error(d.detail || 'No se pudo actualizar'); return d })).then(d => { setLogistics(d); setLogisticsError('') }).catch(e => { if (e.name !== 'AbortError') setLogisticsError(e.message) }).finally(() => setLogisticsLoading(false)) }} /> : view === 'procedures' ? <ProcedureCopilot scenario={procedureScenario} onScenarioChange={setProcedureScenario} onMockConsult={() => { setLastAiProvider('mock'); recordAiUsage('mock', null, 'Consulta de procedimiento') }} onEscalate={incident => { setIncidents(current => [{ ...incident, id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, status: 'open', createdAt: new Date().toISOString() }, ...current]); setView('incidents') }} /> : view === 'incidents' ? <IncidentsDashboard incidents={incidents} onResolve={id => setIncidents(current => current.map(item => item.id === id ? { ...item, status: 'resolved', resolvedAt: new Date().toISOString() } : item))} onGoToProcedures={() => setView('procedures')} /> : view === 'evidence' ? <EvidenceDashboard snapshot={snapshot} snapshotAt={snapshotAt} analysis={analysis} incidents={incidents} flags={evidenceFlags} onToggle={id => setEvidenceFlags(current => ({ ...current, [id]: !current[id] }))} /> : <CameraDashboard {...{ videoRef, captureCanvasRef, motionCanvasRef, cameraState, statusText, startCamera, stopCamera, captureSnapshot, snapshot, setSnapshot, snapshotAt, setSnapshotAt, setAnalysis, analysis, motionDetected, setMotionDetected, analyzeSnapshot, busy, events, setEvents, motionActive, setMotionActive, error, setError }} />}
     </main></div>
 }
 
@@ -85,7 +149,7 @@ function CameraDashboard({ videoRef, captureCanvasRef, motionCanvasRef, cameraSt
       <aside className="side-column"><section className="panel summary-panel"><div className="panel-heading"><div><h2>Estado de la demo</h2><p>Resumen de esta sesión</p></div></div><SummaryRow label="Fuente" value="Webcam local"/><SummaryRow label="Capturas" value={snapshot ? '1' : '0'}/><SummaryRow label="Movimiento" value={motionActive ? 'Activo' : 'Inactivo'} active={motionActive}/><SummaryRow label="Incidencias" value={events.filter(e => e.status === 'alert').length} alert={events.some(e => e.status === 'alert')}/></section><section className="panel events-panel"><div className="panel-heading"><div><h2>Actividad reciente</h2><p>Eventos generados en esta sesión</p></div><button className="icon-button" onClick={() => setEvents([])} aria-label="Limpiar actividad"><RefreshCw size={17}/></button></div>{events.length ? <div className="event-list">{events.map(event => <EventItem event={event} key={event.id}/>)}</div> : <div className="empty-activity">No hay actividad registrada.</div>}</section></aside></section>{error && <div className="error-banner"><AlertTriangle size={17}/>{error}</div>}</>
 }
 
-function LogisticsDashboard({ data, error, loading, onRefresh, onProviderUsed }) {
+function LogisticsDashboard({ data, error, loading, authFetch, onRefresh, onProviderUsed }) {
   const [clockNow, setClockNow] = useState(Date.now())
   const [question, setQuestion] = useState('')
   const [chatBusy, setChatBusy] = useState(false)
@@ -103,13 +167,13 @@ function LogisticsDashboard({ data, error, loading, onRefresh, onProviderUsed })
     setChatMessages(current => [...current, { role: 'user', text }])
     setChatBusy(true)
     try {
-      const response = await fetch(`${API_URL}/api/logistics/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: text, vehicles, analytics: data.analytics }) })
+      const response = await authFetch(`${API_URL}/api/logistics/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: text, vehicles, analytics: data.analytics }) })
       const result = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`)
       onProviderUsed(result.provider || 'mock', result.usage, result.model_id)
       setChatMessages(current => [...current, { role: 'assistant', text: result.answer, provider: result.provider, usage: result.usage }])
     } catch (err) {
-      setChatMessages(current => [...current, { role: 'assistant', text: `No se pudo consultar la flota: ${err.message}` }])
+      if (err.name !== 'AbortError') setChatMessages(current => [...current, { role: 'assistant', text: `No se pudo consultar la flota: ${err.message}` }])
     } finally { setChatBusy(false) }
   }
   return <div className="logistics-view"><div className="demo-notice"><CircleHelp size={16}/><span>{data.notice} La posición se anima en este navegador, sin peticiones periódicas.</span><button className="icon-button" onClick={onRefresh} aria-label="Actualizar datos" title="Actualizar"><RefreshCw size={16}/></button></div>
@@ -198,6 +262,32 @@ function EvidenceDashboard({ snapshot, snapshotAt, analysis, incidents, flags, o
       {incidents.map(item => <article className="panel evidence-item" key={`evidence-${item.id}`}><div className="evidence-placeholder"><AlertTriangle size={25}/><span>Registro de incidencia</span><small>Sin imagen adjunta</small></div><div className="evidence-details"><div className="evidence-item-heading"><div><span className="evidence-kind"><BookOpen size={13}/> REGISTRO VINCULADO</span><h2>{item.title}</h2><small>{formatEventTime(item.createdAt)} · Copiloto de procedimientos · {item.status === 'open' ? 'pendiente' : 'resuelta'}</small></div><span className={`retention-badge ${flags[`incident-${item.id}`] ? 'keep' : ''}`}>{flags[`incident-${item.id}`] ? 'Conservar (demo)' : 'Caducable (demo)'}</span></div><p>{item.interpretation}</p><div className="evidence-origin"><strong>Origen:</strong> {item.camera} · {item.vehicle}</div><div className="evidence-actions"><button className={`button ${flags[`incident-${item.id}`] ? 'motion-on' : 'secondary'}`} onClick={() => onToggle(`incident-${item.id}`)}>{flags[`incident-${item.id}`] ? <CheckCircle2 size={15}/> : <ShieldCheck size={15}/>} {flags[`incident-${item.id}`] ? 'Marcado para conservar' : 'Marcar almacenable'}</button><small>Este registro y su etiqueta solo existen en esta sesión.</small></div></div></article>)}
     </div>}
   </div>
+}
+
+function LoginScreen({ onAuthenticated }) {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [challenge, setChallenge] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  async function submit(event) {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      if (challenge) {
+        onAuthenticated(await completeNewPassword(challenge, newPassword))
+      } else {
+        const result = await signInCognito(email, password)
+        if (result.session) onAuthenticated(result.session)
+        else setChallenge(result)
+      }
+    } catch (err) {
+      setError(err.message || 'No se pudo iniciar sesión. Revisa el correo y la contraseña.')
+    } finally { setBusy(false) }
+  }
+  return <main className="auth-page"><section className="auth-card"><div className="auth-brand"><div className="brand-mark">B</div><div><strong>BG Logistics</strong><span>Monitor operativo</span></div></div><div className="auth-heading"><span className="auth-icon"><LockKeyhole size={20}/></span><div><h1>Acceso seguro</h1><p>Inicia sesión para acceder a la demo.</p></div></div><form className="auth-form" onSubmit={submit}>{!challenge ? <><label>Correo electrónico<input type="email" autoComplete="username" value={email} onChange={event => setEmail(event.target.value)} required autoFocus/></label><label>Contraseña<input type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required/></label></> : <><div className="auth-challenge">Tu cuenta necesita una contraseña nueva antes de continuar.</div><label>Nueva contraseña<input type="password" autoComplete="new-password" value={newPassword} onChange={event => setNewPassword(event.target.value)} minLength={8} required autoFocus/></label></>}{error && <div className="auth-error" role="alert"><AlertTriangle size={15}/>{error}</div>}<button className="button primary auth-submit" type="submit" disabled={busy}>{busy ? <RefreshCw className="spin" size={16}/> : <LockKeyhole size={16}/>} {busy ? 'Validando…' : challenge ? 'Guardar contraseña y entrar' : 'Iniciar sesión'}</button></form><div className="auth-footnote"><ShieldCheck size={14}/> Autenticación gestionada por Amazon Cognito.</div></section></main>
 }
 
 function UsageDashboard({ usage, onClear }) {
